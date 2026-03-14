@@ -1,29 +1,53 @@
 // hand.js
 //
+// RENDERING + ANIMATION LAYER for the enemy hands.
+//
+// ARCHITECTURE RULE:
+//   HandManager does NOT own tile color data.
+//   It reads tile colors from state via getTileColor(row, col).
+//   It advances tile colors via onHandClick(row, col) — a callback set by main.js.
+//   main.js is the one that calls state.cycleColor() and grid.renderTile().
+//
+// HandManager only knows: where to move, when to move, and when it has arrived.
+// What happens to the tile when it arrives is not HandManager's business.
+//
 // NAMING CONVENTION:
-//   hand.side  = which side of the grid the hand sits on: "left" | "right" | "top" | "bottom"
-//   hand.index = which lane: row index for left/right sides, col index for top/bottom sides
-//
-//   The hand always points TOWARD the grid and moves TOWARD it.
-//
-//   side "left"   → sits LEFT of grid,  points RIGHT, moves right  (rotation = 0)
-//   side "right"  → sits RIGHT of grid, points LEFT,  moves left   (rotation = PI)
-//   side "top"    → sits ABOVE grid,    points DOWN,  moves down   (rotation = PI/2)
-//   side "bottom" → sits BELOW grid,    points UP,    moves up     (rotation = -PI/2)
+//   hand.side  = "left" | "right" | "top" | "bottom"
+//   hand.index = row index (left/right) or col index (top/bottom)
 
 export class HandManager {
-  constructor(app, grid, targetColor = null) {
+  /**
+   * @param {PIXI.Application} app
+   * @param {GridManager}      grid
+   * @param {Function}         getTileColor   (row, col) => colorValue  — reads state
+   * @param {Function}         onHandClick    (row, col) => void        — mutates state + re-renders
+   */
+  constructor(app, grid, getTileColor, onHandClick) {
     this.app = app;
     this.grid = grid;
-    this.targetColor = targetColor; // hex number e.g. 0xff0000. null = hands frozen.
+
+    // These are injected by main.js so HandManager never imports state directly.
+    this.getTileColor = getTileColor;
+    this.onHandClick = onHandClick;
+
+    // The color value hands are hunting for.
+    // Set by main.js via setTargetColor() when a new level starts.
+    this.targetColor = null;
 
     this.hands = [];
+    this.claimedTiles = new Set(); // "row,col" strings
 
-    // Tiles currently claimed by a moving hand. Prevents two hands targeting
-    // the same tile simultaneously. Stored as "row,col" strings.
-    this.claimedTiles = new Set();
+    // ── CONCURRENCY CONTROL ──────────────────────────────────────────────────
+    // How many hands are currently in an active (creeping or fast) state.
+    // Retreating hands do NOT count — they are no longer a threat.
+    this.activeCount = 0;
 
-    // All speed values are in LOCAL grid coords per ticker delta unit.
+    // Set by applySettings() when a level starts. Defaults are very
+    // conservative so the game is playable before the first call.
+    this.maxActive = 1;
+    this.cooldownMs = 8000;
+    // ────────────────────────────────────────────────────────────────────────
+
     this.gap = 25;
     this.creepSpeed = 0.5;
     this.fastSpeed = 3.0;
@@ -34,16 +58,65 @@ export class HandManager {
     this.app.ticker.add((ticker) => this.update(ticker.deltaTime));
   }
 
-  // -------------------------------------------------------
-  // PUBLIC API — call from game logic when the target color changes
-  // -------------------------------------------------------
+  /**
+   * Immediately send every active hand home.
+   * Called on win — hands retreat before the countdown starts.
+   * Slapped hands stay slapped (they're already out of play).
+   */
+  retreatAll() {
+    for (const hand of this.hands) {
+      if (hand.state === "creeping" || hand.state === "fast") {
+        // Release active slot and claimed tile before forcing retreat
+        this.activeCount--;
+        if (hand.targetTile) {
+          this.claimedTiles.delete(
+            `${hand.targetTile.row},${hand.targetTile.col}`,
+          );
+          hand.targetTile = null;
+        }
+        hand.state = "retreating";
+      } else if (hand.state === "idle") {
+        // Push idle hands' next move time far into the future so they
+        // don't launch during the countdown. Will be reset by applySettings.
+        hand.nextMoveTime = performance.now() + 999999;
+      }
+    }
+  }
+
+  /**
+   * Reset all hands to idle with a fresh cooldown.
+   * Called after the countdown ends to resume normal play.
+   */
+  resumeAll() {
+    for (const hand of this.hands) {
+      if (hand.state === "slapped") continue;
+      // Let retreating hands finish naturally; only reset idle ones
+      if (hand.state === "idle") {
+        hand.nextMoveTime = performance.now() + this.cooldown();
+      }
+    }
+  }
+  /* Called from main.js after startLevel() sets up the sequence.
+   *
+   * @param {number|null} color  Pixi hex value e.g. 0xE69F00, or null to freeze hands
+   */
   setTargetColor(color) {
     this.targetColor = color;
   }
 
-  // -------------------------------------------------------
-  // CREATE
-  // -------------------------------------------------------
+  /**
+   * Apply difficulty settings from the HAND_SCHEDULE for the current level.
+   * Call this from main.js every time a new level starts.
+   *
+   * @param {{ maxActive: number, cooldownMs: number }} settings
+   */
+  applySettings(settings) {
+    this.maxActive = settings.maxActive;
+    this.cooldownMs = settings.cooldownMs;
+  }
+
+  // ── CREATE ─────────────────────────────────────────────────────────────────
+
   createHands() {
     const sides = ["left", "right", "top", "bottom"];
 
@@ -53,8 +126,8 @@ export class HandManager {
         hand.side = side;
         hand.index = i;
         hand.state = "idle";
-        hand.targetTile = null; // { row, col, tile } — set when hand starts moving
-        hand.nextMoveTime = performance.now() + this.randomDelay();
+        hand.targetTile = null;
+        hand.nextMoveTime = performance.now() + this.cooldown();
 
         this.grid.container.addChild(hand);
         this.hands.push(hand);
@@ -62,13 +135,7 @@ export class HandManager {
     }
   }
 
-  // -------------------------------------------------------
-  // SHAPE
-  //
-  // Triangle drawn pointing RIGHT in local space:
-  //   base-top (0, 0) · tip (handLen, halfH) · base-bot (0, ts)
-  //   pivot at (0, halfH) — blunt end center
-  // -------------------------------------------------------
+  // Triangle pointing RIGHT in local space. Pivot at blunt end center.
   createHandSprite() {
     const ts = this.grid.tileSize;
     const handLen = ts;
@@ -94,10 +161,8 @@ export class HandManager {
     return hand;
   }
 
-  // -------------------------------------------------------
-  // POSITION — all local coordinates, no scaling math needed.
-  // Hands are grid.container children so scale/resize is free.
-  // -------------------------------------------------------
+  // ── POSITION ───────────────────────────────────────────────────────────────
+
   positionHands() {
     const ts = this.grid.tileSize;
     const pad = this.grid.padding;
@@ -138,10 +203,8 @@ export class HandManager {
     }
   }
 
-  // -------------------------------------------------------
-  // TIP POSITION (local space)
-  // Tip is always handLen ahead of pivot in the pointing direction.
-  // -------------------------------------------------------
+  // ── TIP POSITION (local space) ─────────────────────────────────────────────
+
   tipX(hand) {
     if (hand.side === "left") return hand.x + hand._handLen;
     if (hand.side === "right") return hand.x - hand._handLen;
@@ -154,17 +217,11 @@ export class HandManager {
     return hand.y;
   }
 
-  // -------------------------------------------------------
-  // TILE SCANNING
+  // ── TILE SCANNING ──────────────────────────────────────────────────────────
   //
-  // Find all tiles in this hand's lane that match targetColor
-  // and are not already claimed by another hand.
-  //
-  // For left/right: lane = row `hand.index`, scan all cols.
-  // For top/bottom: lane = col `hand.index`, scan all rows.
-  //
-  // Returns array of { row, col, tile, centerX, centerY }
-  // -------------------------------------------------------
+  // KEY CHANGE: reads tile color from state (via this.getTileColor),
+  // NOT from tile.tint. The visual object is never consulted for logic.
+
   findEligibleTiles(hand) {
     if (this.targetColor === null) return [];
 
@@ -173,24 +230,21 @@ export class HandManager {
     const half = ts / 2;
     const results = [];
 
-    const tileMatches = (tile) => {
-      // Tint 0xffffff means "no tint applied" = original color.
-      // Compare against targetColor. When real tile color data exists,
-      // swap this for tile.colorValue === this.targetColor.
-      return tile.tint === this.targetColor;
-    };
+    const tileMatches = (row, col) =>
+      this.getTileColor(row, col) === this.targetColor;
 
     const claimKey = (row, col) => `${row},${col}`;
 
     if (hand.side === "left" || hand.side === "right") {
       const row = hand.index;
       for (let col = 0; col < this.grid.cols; col++) {
-        const tile = this.grid.tiles[row][col];
-        if (tileMatches(tile) && !this.claimedTiles.has(claimKey(row, col))) {
+        if (
+          tileMatches(row, col) &&
+          !this.claimedTiles.has(claimKey(row, col))
+        ) {
           results.push({
             row,
             col,
-            tile,
             centerX: col * (ts + pad) + half,
             centerY: row * (ts + pad) + half,
           });
@@ -201,12 +255,13 @@ export class HandManager {
     if (hand.side === "top" || hand.side === "bottom") {
       const col = hand.index;
       for (let row = 0; row < this.grid.rows; row++) {
-        const tile = this.grid.tiles[row][col];
-        if (tileMatches(tile) && !this.claimedTiles.has(claimKey(row, col))) {
+        if (
+          tileMatches(row, col) &&
+          !this.claimedTiles.has(claimKey(row, col))
+        ) {
           results.push({
             row,
             col,
-            tile,
             centerX: col * (ts + pad) + half,
             centerY: row * (ts + pad) + half,
           });
@@ -217,40 +272,22 @@ export class HandManager {
     return results;
   }
 
-  // -------------------------------------------------------
-  // SHOULD THIS HAND MOVE?
-  //
-  // Scans lane for eligible tiles. If found, claims the closest
-  // one (nearest to the hand's entry edge) and stores it on the hand.
-  // -------------------------------------------------------
   shouldHandMove(hand) {
     const eligible = this.findEligibleTiles(hand);
     if (eligible.length === 0) return false;
 
-    // Pick the tile closest to this hand's entry edge
-    // so it doesn't have to travel further than necessary.
-    let target;
-    if (hand.side === "left") {
-      target = eligible.reduce((a, b) => (a.col < b.col ? a : b));
-    } else if (hand.side === "right") {
-      target = eligible.reduce((a, b) => (a.col > b.col ? a : b));
-    } else if (hand.side === "top") {
-      target = eligible.reduce((a, b) => (a.row < b.row ? a : b));
-    } else {
-      // bottom
-      target = eligible.reduce((a, b) => (a.row > b.row ? a : b));
-    }
+    // Pick randomly from all eligible tiles in this lane so the hands are
+    // unpredictable. A player should never be able to "hide" tiles by working
+    // from a predictable direction — any final-color tile in the lane is fair game.
+    const target = eligible[Math.floor(Math.random() * eligible.length)];
 
-    // Claim it so no other hand can take it
     this.claimedTiles.add(`${target.row},${target.col}`);
     hand.targetTile = target;
-
     return true;
   }
 
-  // -------------------------------------------------------
-  // UPDATE
-  // -------------------------------------------------------
+  // ── UPDATE LOOP ────────────────────────────────────────────────────────────
+
   update(delta) {
     const safeDelta = Math.min(delta, 1);
     const now = performance.now();
@@ -259,10 +296,13 @@ export class HandManager {
       if (hand.state === "slapped") continue;
 
       if (hand.state === "idle" && now >= hand.nextMoveTime) {
-        if (this.shouldHandMove(hand)) {
+        // Only launch if we're under the concurrency limit for this level
+        if (this.activeCount < this.maxActive && this.shouldHandMove(hand)) {
           hand.state = "creeping";
+          this.activeCount++; // slot consumed — hand is now active
         } else {
-          hand.nextMoveTime = now + this.randomDelay();
+          // Nothing to do yet — check again after a short retry interval
+          hand.nextMoveTime = now + 500 + Math.random() * 500;
         }
       }
 
@@ -272,13 +312,17 @@ export class HandManager {
     }
   }
 
-  randomDelay() {
-    return 1000 + Math.random() * 3000;
+  /**
+   * Returns a cooldown duration in ms for a hand returning home.
+   * Uses this.cooldownMs (set by applySettings) plus a random jitter
+   * so hands don't all fire in perfect synchrony.
+   */
+  cooldown() {
+    return this.cooldownMs + Math.random() * 2000;
   }
 
-  // -------------------------------------------------------
-  // MOVEMENT
-  // -------------------------------------------------------
+  // ── MOVEMENT ───────────────────────────────────────────────────────────────
+
   advanceHand(hand, speed) {
     if (hand.side === "left") hand.x += speed;
     if (hand.side === "right") hand.x -= speed;
@@ -286,18 +330,17 @@ export class HandManager {
     if (hand.side === "bottom") hand.y -= speed;
   }
 
-  // Creep until tip crosses the grid edge, then switch to fast
   moveHandCreep(hand, delta) {
     this.advanceHand(hand, this.creepSpeed * delta);
     if (this.isTipOnGrid(hand)) hand.state = "fast";
   }
 
-  // Fast until tip reaches the center of the target tile
   moveHandFast(hand, delta) {
     this.advanceHand(hand, this.fastSpeed * delta);
     if (this.hasTipReachedTarget(hand)) {
-      this.clickTile(hand);
+      this.arriveAtTile(hand);
       hand.state = "retreating";
+      this.activeCount--; // slot released — retreating is not a threat
     }
   }
 
@@ -312,8 +355,8 @@ export class HandManager {
       hand.x = hand.homeX;
       hand.y = hand.homeY;
       hand.state = "idle";
-      hand.nextMoveTime = performance.now() + this.randomDelay();
-      // Release the claimed tile so other hands can target it next round
+      hand.nextMoveTime = performance.now() + this.cooldown();
+
       if (hand.targetTile) {
         this.claimedTiles.delete(
           `${hand.targetTile.row},${hand.targetTile.col}`,
@@ -323,9 +366,8 @@ export class HandManager {
     }
   }
 
-  // -------------------------------------------------------
-  // GRID CHECKS
-  // -------------------------------------------------------
+  // ── GRID CHECKS ────────────────────────────────────────────────────────────
+
   getTotalW() {
     return (
       this.grid.cols * (this.grid.tileSize + this.grid.padding) -
@@ -339,7 +381,6 @@ export class HandManager {
     );
   }
 
-  // Tip has crossed the grid edge → switch from creep to fast
   isTipOnGrid(hand) {
     if (hand.side === "left") return this.tipX(hand) >= 0;
     if (hand.side === "right") return this.tipX(hand) <= this.getTotalW();
@@ -347,7 +388,6 @@ export class HandManager {
     if (hand.side === "bottom") return this.tipY(hand) <= this.getTotalH();
   }
 
-  // Tip has reached the center of the claimed target tile → click and retreat
   hasTipReachedTarget(hand) {
     if (!hand.targetTile) return false;
     const { centerX, centerY } = hand.targetTile;
@@ -357,26 +397,32 @@ export class HandManager {
     if (hand.side === "bottom") return this.tipY(hand) <= centerY;
   }
 
-  // -------------------------------------------------------
-  // CLICK TILE — tip is at target tile center
-  // -------------------------------------------------------
-  clickTile(hand) {
-    if (!hand.targetTile) return;
-    const { tile } = hand.targetTile;
+  // ── ARRIVE AT TILE ─────────────────────────────────────────────────────────
+  //
+  // KEY CHANGE: renamed from clickTile(). No longer touches tile.tint.
+  // Delegates entirely to the callback injected by main.js,
+  // which handles state mutation and re-rendering.
 
-    // TODO: replace with real game logic — cycle tile to next color in sequence
-    // For now: reset tint to white (base color) as a visible dummy effect
-    tile.tint = 0xaaaaaa;
+  arriveAtTile(hand) {
+    if (!hand.targetTile) return;
+    const { row, col } = hand.targetTile;
+
+    // Tell main.js "a hand just landed here" — it handles everything else.
+    if (this.onHandClick) this.onHandClick(row, col);
   }
 
-  // -------------------------------------------------------
-  // SLAP — player stops this hand by clicking it
-  // -------------------------------------------------------
+  // ── SLAP ───────────────────────────────────────────────────────────────────
+
   slapHand(hand) {
     if (hand.state === "slapped") return;
+
+    // Release the active slot if this hand was advancing
+    if (hand.state === "creeping" || hand.state === "fast") {
+      this.activeCount--;
+    }
+
     hand.state = "slapped";
 
-    // Release the claim immediately on slap so other hands can take over
     if (hand.targetTile) {
       this.claimedTiles.delete(`${hand.targetTile.row},${hand.targetTile.col}`);
       hand.targetTile = null;
@@ -401,6 +447,6 @@ export class HandManager {
     hand.x = hand.homeX;
     hand.y = hand.homeY;
     hand.state = "idle";
-    hand.nextMoveTime = performance.now() + this.randomDelay();
+    hand.nextMoveTime = performance.now() + this.cooldown();
   }
 }
